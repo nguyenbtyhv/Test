@@ -1,22 +1,42 @@
 <?php
 session_start();
-$mysqli = new mysqli('localhost', 'root', '', 'test');
-$mysqli->set_charset('utf8');
 
-if (!isset($_SESSION['csrf_token'])) {
-    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+// Error reporting and security headers
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+
+// Security headers
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('X-XSS-Protection: 1; mode=block');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+
+// Include required files
+require_once 'config/database.php';
+require_once 'config/security.php';
+require_once 'models/User.php';
+require_once 'models/Comic.php';
+
+// Initialize database and models
+try {
+    $db = new Database();
+    $userModel = new User();
+    $comicModel = new Comic();
+} catch (Exception $e) {
+    die('System error. Please try again later.');
 }
-if ($user && isset($_GET['like_comment'])) {
-    $cid = (int)$_GET['like_comment'];
-    $liked = $mysqli->query("SELECT 1 FROM comment_likes WHERE comment_id=$cid AND user_id={$user['id']}")->num_rows;
-    if ($liked) {
-        $mysqli->query("DELETE FROM comment_likes WHERE comment_id=$cid AND user_id={$user['id']}");
-    } else {
-        $mysqli->query("INSERT IGNORE INTO comment_likes (comment_id, user_id) VALUES ($cid, {$user['id']})");
-    }
-    header("Location: ".$_SERVER['HTTP_REFERER']);
-    exit;
+
+// Generate CSRF token
+$csrf_token = Security::generateCSRFToken();
+
+// Get current user
+$user = null;
+if (isset($_SESSION['user_id'])) {
+    $user = $userModel->getUserById($_SESSION['user_id']);
 }
+
+// Get page parameter
+$page = $_GET['page'] ?? 'home';
 function getCommentCount($comic_id) {
     global $mysqli;
     $result = $mysqli->query("SELECT COUNT(*) as count FROM comments WHERE comic_id = $comic_id")->fetch_assoc();
@@ -264,12 +284,27 @@ function displayChapterContent($ch) {
     echo '</div>';
 }
 
-echo '<!DOCTYPE html>
+?>
+<!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ComicHub - Website Truyện Tranh</title>
+    <meta name="csrf-token" content="<?php echo $csrf_token; ?>">
+    <title><?php echo $page == 'home' ? 'MangaHub - Website Đọc Truyện Tranh Online' : 'MangaHub'; ?></title>
+    <meta name="description" content="Website đọc truyện tranh online miễn phí với giao diện đẹp mắt và tính năng hiện đại">
+    <meta name="keywords" content="truyện tranh, manga, comic, đọc truyện online, NetTruyen, TruyenQQ">
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    
+    <!-- CSS -->
+    <link rel="stylesheet" href="assets/css/style.css">
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
     <style>
     body {
         background: #16181d;
