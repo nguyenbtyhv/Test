@@ -1,1464 +1,962 @@
 <?php
 session_start();
 
-// Error reporting and security headers
-error_reporting(E_ALL);
-ini_set('display_errors', 0);
+// Database connection
+$host = 'localhost';
+$username = 'root';
+$password = '';
+$database = 'manga_website';
 
-// Security headers
-header('X-Content-Type-Options: nosniff');
-header('X-Frame-Options: DENY');
-header('X-XSS-Protection: 1; mode=block');
-header('Referrer-Policy: strict-origin-when-cross-origin');
-
-// Include required files
-require_once 'config/database.php';
-require_once 'config/security.php';
-require_once 'models/User.php';
-require_once 'models/Comic.php';
-
-// Initialize database and models
 try {
-    $db = new Database();
-    $userModel = new User();
-    $comicModel = new Comic();
+    $mysqli = new mysqli($host, $username, $password, $database);
+    $mysqli->set_charset('utf8mb4');
+    
+    if ($mysqli->connect_error) {
+        die("Kết nối database thất bại: " . $mysqli->connect_error);
+    }
 } catch (Exception $e) {
-    die('System error. Please try again later.');
+    die("Lỗi database: " . $e->getMessage());
 }
 
-// Generate CSRF token
-$csrf_token = Security::generateCSRFToken();
+// CSRF Token
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// Helper functions
+function sanitize($data) {
+    return htmlspecialchars(trim($data), ENT_QUOTES, 'UTF-8');
+}
+
+function getUser($mysqli) {
+    if (isset($_SESSION['user_id'])) {
+        $user_id = (int)$_SESSION['user_id'];
+        $result = $mysqli->query("SELECT * FROM users WHERE id = $user_id");
+        return $result ? $result->fetch_assoc() : null;
+    }
+    return null;
+}
+
+function getTimeAgo($datetime) {
+    $time = time() - strtotime($datetime);
+    if ($time < 60) return 'vừa xong';
+    if ($time < 3600) return floor($time/60) . ' phút trước';
+    if ($time < 86400) return floor($time/3600) . ' giờ trước';
+    return floor($time/86400) . ' ngày trước';
+}
 
 // Get current user
-$user = null;
-if (isset($_SESSION['user_id'])) {
-    $user = $userModel->getUserById($_SESSION['user_id']);
-}
-
-// Get page parameter
+$user = getUser($mysqli);
 $page = $_GET['page'] ?? 'home';
-function getCommentCount($comic_id) {
-    global $mysqli;
-    $result = $mysqli->query("SELECT COUNT(*) as count FROM comments WHERE comic_id = $comic_id")->fetch_assoc();
-    return $result['count'];
-} 
-function getTimeAgo($time) {
-    $diff = time() - strtotime($time);
-    if($diff < 60) return 'vài giây trước';
-    if($diff < 3600) return round($diff/60) . ' phút trước';
-    if($diff < 86400) return round($diff/3600) . ' giờ trước';
-    if($diff < 2592000) return round($diff/86400) . ' ngày trước';
-    if($diff < 31536000) return round($diff/2592000) . ' tháng trước';
-    return round($diff/31536000) . ' năm trước';
-}
-function getPrevChapter($comic_id, $chapter_id) {
-    global $mysqli;
-    $res = $mysqli->query("SELECT id FROM chapters WHERE comic_id=$comic_id AND id < $chapter_id ORDER BY id DESC LIMIT 1")->fetch_assoc();
-    return $res ? $res['id'] : null;
-}
-function getNextChapter($comic_id, $chapter_id) {
-    global $mysqli;
-    $res = $mysqli->query("SELECT id FROM chapters WHERE comic_id=$comic_id AND id > $chapter_id ORDER BY id ASC LIMIT 1")->fetch_assoc();
-    return $res ? $res['id'] : null;
-}
-function validateCSRFToken($token) {
-    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
-}
-function canPostComment($user_id) {
-    global $mysqli;
-    $check = $mysqli->query(
-        "SELECT COUNT(*) as count 
-         FROM comments 
-         WHERE user_id = $user_id 
-         AND created_at >= NOW() - INTERVAL 5 MINUTE"
-    )->fetch_assoc();
-    if ($check['count'] >= 10) {
-        return ['allowed' => false, 'message' => 'Bạn đã bình luận quá nhiều. Vui lòng đợi một lát.'];
-    }
-    $lastComment = $mysqli->query(
-        "SELECT created_at 
-         FROM comments 
-         WHERE user_id = $user_id 
-         ORDER BY created_at DESC 
-         LIMIT 1"
-    )->fetch_assoc();
-    if ($lastComment && (time() - strtotime($lastComment['created_at'])) < 15) {
-        return ['allowed' => false, 'message' => 'Vui lòng đợi 15 giây giữa các lần bình luận.'];
-    }
-    return ['allowed' => true];
-}
-function handleLevelUp($user_id) {
-    global $mysqli;
-    $realms = [
-        'Luyện Khí', 'Trúc Cơ', 'Kết Đan', 'Nguyên Anh', 'Hoá Thần',
-        'Luyện Hư', 'Hợp Thể', 'Đại Thừa', 'Độ Kiếp'
-    ];
-    $current = $mysqli->query("SELECT level,realm,realm_stage FROM users WHERE id=$user_id")->fetch_assoc();
-    $realmIdx = array_search($current['realm'], $realms);
-    $stage = (int)$current['realm_stage'];
 
-    // Quy tắc: Mỗi cảnh giới cần số chương đọc: (10*($realmIdx+1)+$stage*($realmIdx+1)*3)
-    $needed = ($realmIdx+1)*10 + ($stage-1)*($realmIdx+1)*3;
-    $history = $mysqli->query("SELECT COUNT(*) as cnt FROM read_history WHERE user_id=$user_id")->fetch_assoc()['cnt'];
-    if ($history >= $needed) {
-        if ($stage < 10) {
-            $mysqli->query("UPDATE users SET realm_stage = realm_stage + 1 WHERE id = $user_id");
-        } else {
-            if ($realmIdx < count($realms)-1) {
-                $nextRealm = $realms[$realmIdx+1];
-                $mysqli->query("UPDATE users SET realm = '$nextRealm', realm_stage = 1 WHERE id = $user_id");
-            }
-        }
-    }
-}
-function displayComments($comic_id, $chapter_id = null) {
-    global $mysqli, $user;
-
-    $where = $chapter_id ? "chapter_id = $chapter_id" : "comic_id = $comic_id AND chapter_id IS NULL";
-    $query = "
-        SELECT c.*, u.username, u.role, u.realm, u.realm_stage
-        FROM comments c
-        JOIN users u ON c.user_id = u.id
-        WHERE $where AND parent_id IS NULL
-        ORDER BY c.created_at DESC
-    ";
-    $comments = $mysqli->query($query);
-
-    while ($row = $comments->fetch_assoc()) {
-        echo "<div class='comment-item'>";
-        // Avatar
-        echo "<div class='comment-avatar'><img src='https://via.placeholder.com/40?text=Avatar'></div>";
-        // Nội dung comment
-        echo "<div class='comment-content'>";
-        // Header
-        echo "<div class='comment-header'><span class='comment-username'>".htmlspecialchars($row['username'])."</span> ";
-
-        // Cảnh giới sau tên
-        if ($row['realm']) {
-            $stage = $row['realm_stage'];
-            $display_stage = ($stage == 10) ? "Đỉnh phong" : $stage;
-            echo "<span class='comment-realm' style='color:#f7c500;font-size:0.92em;padding-left:4px'>[".htmlspecialchars($row['realm'])." - $display_stage/10]</span>";
-        }
-
-        // Tag vai trò
-        echo ($row['role'] == 'admin' ? "<span class='tag-admin'>Admin</span>" : "") .
-             ($row['role'] == 'team' ? "<span class='tag-team'>Nhóm dịch</span>" : "") .
-             ($row['role'] == 'translator' ? "<span class='tag-translator'>Nhà dịch</span>" : "");
-        echo "<span class='comment-time'>".getTimeAgo($row['created_at'])."</span></div>";
-        // Nội dung
-        echo "<div class='comment-text'>".nl2br(htmlspecialchars($row['content']))."</div>";
-
-        // Like, trả lời
-        $likes = $mysqli->query("SELECT COUNT(*) as cnt FROM comment_likes WHERE comment_id={$row['id']}")->fetch_assoc()['cnt'];
-        $userLiked = $user ? $mysqli->query("SELECT 1 FROM comment_likes WHERE comment_id={$row['id']} AND user_id={$user['id']}")->num_rows : 0;
-        echo "<div class='comment-actions' style='margin-top:4px'>";
-        echo "<a href='?page=".$_GET['page']."&id=".$comic_id."&like_comment={$row['id']}' class='btn-link' style='color:".($userLiked?"#f44336":"#09f")."'>";
-        echo "❤ {$likes}</a>";
-        if ($user) {
-            echo "<button class='btn-link' type='button' onclick='showReplyForm({$row['id']})'>Trả lời</button>";
-        }
-        echo "</div>";
-
-        // Form trả lời
-        if ($user) {
-            echo "
-            <form method='POST' class='reply-form' id='reply-form-{$row['id']}' style='display:none;margin-top:10px;'>
-                <input type='hidden' name='csrf_token' value='{$_SESSION['csrf_token']}'>
-                <input type='hidden' name='parent_id' value='{$row['id']}'>
-                <textarea name='reply_content' class='form-input' rows='2' placeholder='Nội dung phản hồi...' required></textarea>
-                <button type='submit' name='post_reply' class='primary-btn' style='margin-top:6px;'>Gửi</button>
-            </form>
-            ";
-        }
-
-        echo "</div>"; // comment-content
-
-        // PHẢN HỒI
-        $replies = $mysqli->query("SELECT c.*, u.username, u.role, u.realm, u.realm_stage
-                                   FROM comments c 
-                                   JOIN users u ON c.user_id = u.id 
-                                   WHERE parent_id = {$row['id']} 
-                                   ORDER BY c.created_at ASC");
-        if ($replies && $replies->num_rows > 0) {
-            echo "<div class='comment-replies'>";
-            while ($rep = $replies->fetch_assoc()) {
-                echo "<div class='reply-item'>";
-                echo "<div class='comment-avatar'><img src='https://via.placeholder.com/30?text=Avatar'></div>";
-                echo "<div class='reply-content'>";
-                echo "<div class='comment-header'><span class='comment-username'>".htmlspecialchars($rep['username'])."</span> ";
-                // Cảnh giới reply
-                if ($rep['realm']) {
-                    $stage = $rep['realm_stage'];
-                    $display_stage = ($stage == 10) ? "Đỉnh phong" : $stage;
-                    echo "<span class='comment-realm' style='color:#f7c500;font-size:0.92em;padding-left:4px'>[".htmlspecialchars($rep['realm'])." - $display_stage/10]</span>";
-                }
-                echo ($rep['role'] == 'admin' ? "<span class='tag-admin'>Admin</span>" : "") .
-($rep['role'] == 'translator' ? "<span class='tag-translator'>Nhà dịch</span>" : "");
-                echo "<span class='comment-time'>".getTimeAgo($rep['created_at'])."</span></div>";
-                echo "<div class='comment-text'>".nl2br(htmlspecialchars($rep['content']))."</div>";
-                // Like cho reply
-                $replyLikes = $mysqli->query("SELECT COUNT(*) as cnt FROM comment_likes WHERE comment_id={$rep['id']}")->fetch_assoc()['cnt'];
-                $replyUserLiked = $user ? $mysqli->query("SELECT 1 FROM comment_likes WHERE comment_id={$rep['id']} AND user_id={$user['id']}")->num_rows : 0;
-                echo "<div class='comment-actions' style='margin-top:2px'>";
-                echo "<a href='?page=".$_GET['page']."&id=".$comic_id."&like_comment={$rep['id']}' class='btn-link' style='color:".($replyUserLiked?"#f44336":"#09f")."'>";
-                echo "❤ {$replyLikes}</a>";
-                echo "</div>";
-                echo "</div></div>";
-            }
-            echo "</div>";
-        }
-
-        echo "</div>"; // comment-item
-    }
-}
-function getUser() {
-    global $mysqli;
-    return isset($_SESSION['user_id']) ? $mysqli->query("SELECT * FROM users WHERE id={$_SESSION['user_id']}")->fetch_assoc() : null;
-}
-function isAdmin() { 
-    $user = getUser();
-    return $user && $user['role'] === 'admin'; 
-}
-function isTranslator() { 
-    $user = getUser();
-    return $user && $user['role'] === 'translator'; 
-}
-function requireRole($roles) { 
-    $user = getUser();
-    if (!$user || !in_array($user['role'], $roles)) {
-        die('<div class="notice warning">Bạn không có quyền truy cập trang này.</div>');
-    }
-}
-$page = $_GET['page'] ?? 'home';
-$user = getUser();
-function increaseChapterView($chapter_id) {
-    global $mysqli;
-    $mysqli->query("UPDATE chapters SET views = IFNULL(views,0)+1 WHERE id = $chapter_id");
-}
-function addHistory($user_id, $chapter_id) {
-    global $mysqli;
-    $mysqli->query("INSERT INTO read_history(user_id, chapter_id, updated_at) VALUES ($user_id, $chapter_id, NOW())
-        ON DUPLICATE KEY UPDATE updated_at = NOW()");
-}
-function getReadChapters($user_id, $comic_id = null) {
-    global $mysqli;
-    $q = "SELECT chapter_id FROM read_history WHERE user_id = $user_id";
-    if ($comic_id) $q .= " AND chapter_id IN (SELECT id FROM chapters WHERE comic_id = $comic_id)";
-    $res = $mysqli->query($q);
-    $ids = [];
-    if ($res) while($r = $res->fetch_assoc()) $ids[] = $r['chapter_id'];
-    return $ids;
-}
-function getUnlockedChapters($user_id, $comic_id = null) {
-    global $mysqli;
-    $q = "SELECT chapter_id FROM chapter_unlocks WHERE user_id = $user_id";
-    if ($comic_id) $q .= " AND chapter_id IN (SELECT id FROM chapters WHERE comic_id = $comic_id)";
-    $res = $mysqli->query($q);
-    $ids = [];
-    if ($res) while($r = $res->fetch_assoc()) $ids[] = $r['chapter_id'];
-    return $ids;
-}
-function getUserComicRating($user_id, $comic_id) {
-    global $mysqli;
-    $r = $mysqli->query("SELECT rating FROM comic_ratings WHERE user_id=$user_id AND comic_id=$comic_id")->fetch_assoc();
-    return $r ? intval($r['rating']) : 0;
-}
-function displayChapterContent($ch) {
-    echo '<div class="chapter-content">';
-    echo '<h1 class="chapter-title">'.$ch['comic_title'].' - '.$ch['chapter_title'].'</h1>';
-    $images = json_decode($ch['images'] ?? '[]', true);
-    if ($images && is_array($images)) {
-        echo '<div class="image-list">';
-        foreach ($images as $img) {
-            echo '<div class="image-item">';
-            echo '<img src="'.htmlspecialchars($img).'" alt="Chapter Image" loading="lazy">';
-            echo '</div>';
-        }
-        echo '</div>';
+// Handle like comment
+if ($user && isset($_GET['like_comment'])) {
+    $comment_id = (int)$_GET['like_comment'];
+    $user_id = $user['id'];
+    
+    $check = $mysqli->query("SELECT id FROM comment_likes WHERE comment_id = $comment_id AND user_id = $user_id");
+    if ($check && $check->num_rows > 0) {
+        $mysqli->query("DELETE FROM comment_likes WHERE comment_id = $comment_id AND user_id = $user_id");
     } else {
-        echo '<div class="notice warning">Chương này chưa có nội dung.</div>';
+        $mysqli->query("INSERT INTO comment_likes (comment_id, user_id) VALUES ($comment_id, $user_id)");
     }
-    echo '<div class="chapter-nav">';
-    echo '<a href="?page=comic&id='.$ch['comic_id'].'" class="primary-btn">Quay lại danh sách chương</a>';
-    echo '</div>';
-    echo '</div>';
+    
+    header("Location: " . $_SERVER['HTTP_REFERER']);
+    exit;
 }
 
+// Create tables if not exist
+$mysqli->query("CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(100) UNIQUE,
+    password VARCHAR(255) NOT NULL,
+    role ENUM('user', 'translator', 'admin') DEFAULT 'user',
+    coins INT DEFAULT 100,
+    realm VARCHAR(50) DEFAULT 'Luyện Khí',
+    realm_stage INT DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS comics (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(200) NOT NULL,
+    description TEXT,
+    thumbnail VARCHAR(500),
+    author VARCHAR(100),
+    status ENUM('ongoing', 'completed', 'dropped') DEFAULT 'ongoing',
+    genres TEXT,
+    views INT DEFAULT 0,
+    follows INT DEFAULT 0,
+    rating DECIMAL(3,2) DEFAULT 0.00,
+    total_rating INT DEFAULT 0,
+    created_by INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS chapters (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    comic_id INT NOT NULL,
+    chapter_title VARCHAR(200) NOT NULL,
+    images TEXT,
+    is_vip BOOLEAN DEFAULT FALSE,
+    coins_unlock INT DEFAULT 0,
+    views INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS user_favorites (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    comic_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_favorite (user_id, comic_id)
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS comic_ratings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    comic_id INT NOT NULL,
+    rating INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_rating (user_id, comic_id)
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS read_history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    chapter_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_read (user_id, chapter_id)
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS chapter_unlocks (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    chapter_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_unlock (user_id, chapter_id)
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS comments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    comic_id INT,
+    chapter_id INT,
+    parent_id INT,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+$mysqli->query("CREATE TABLE IF NOT EXISTS comment_likes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    comment_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY unique_like (user_id, comment_id)
+)");
+
+// Create default admin user if not exists
+$admin_check = $mysqli->query("SELECT id FROM users WHERE username = 'admin'");
+if (!$admin_check || $admin_check->num_rows == 0) {
+    $admin_password = password_hash('admin123', PASSWORD_DEFAULT);
+    $mysqli->query("INSERT INTO users (username, email, password, role, coins, realm, realm_stage) 
+                   VALUES ('admin', 'admin@manga.com', '$admin_password', 'admin', 10000, 'Tiên Nhân', 10)");
+}
 ?>
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="csrf-token" content="<?php echo $csrf_token; ?>">
-    <title><?php echo $page == 'home' ? 'MangaHub - Website Đọc Truyện Tranh Online' : 'MangaHub'; ?></title>
-    <meta name="description" content="Website đọc truyện tranh online miễn phí với giao diện đẹp mắt và tính năng hiện đại">
-    <meta name="keywords" content="truyện tranh, manga, comic, đọc truyện online, NetTruyen, TruyenQQ">
-    
-    <!-- Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    
-    <!-- CSS -->
-    <link rel="stylesheet" href="assets/css/style.css">
-    
-    <!-- Favicon -->
-    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <title>MangaHub - Website Đọc Truyện Tranh</title>
     <style>
-    body {
-        background: #16181d;
-        color: #fff;
-        margin: 0;
-        font-family: "Segoe UI", Arial, Helvetica, sans-serif;
-        min-height: 100vh;
-    }
-    a {
-        color: #09f;
-        text-decoration: none;
-        transition: color 0.2s;
-    }
-    a:hover { color: #fff; }
-    .header-area {
-        background: #1c1e23;
-        border-bottom: 2px solid #24262b;
-        padding: 0;
-    }
-    .navbar-area {
-        padding: 0 24px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        height: 64px;
-    }
-    .logo {
-        font-size: 1.7rem;
-        font-weight: bold;
-        color: #09f;
-        letter-spacing: 2px;
-        padding: 0 18px;
-        background: linear-gradient(45deg, #09f 30%, #fff 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    .menu-area {
-        display: flex;
-        align-items: center;
-    }
-    .menu {
-        display: flex;
-        list-style: none;
-        margin: 0;
-        padding: 0;
-    }
-    .menu-item {
-        margin-left: 24px;
-    }
-    .menu-link {
-        color: #fff;
-        padding: 8px 12px;
-        border-radius: 4px;
-        font-weight: 500;
-        transition: background 0.2s;
-    }
-    .menu-link.active, .menu-link:hover {
-        background: #262932;
-        color: #09f;
-    }
-    .user-area, .auth-area {
-        margin-left: 36px;
-        display: flex;
-        align-items: center;
-    }
-    .avatar, .user-avatar-img img {
-        width: 36px; height: 36px;
-        border-radius: 50%;
-        border: 2px solid #09f;
-        cursor: pointer;
-        background: #222;
-    }
-    .dropdown-menu {
-        display: none;
-        position: absolute;
-        right: 18px;
-        top: 64px;
-        background: #22242a;
-        border: 1px solid #22293a;
-        border-radius: 8px;
-        min-width: 180px;
-        z-index: 10;
-        box-shadow: 0 6px 20px #0006;
-    }
-    .user-toggle:hover .dropdown-menu, .user-toggle:focus .dropdown-menu {
-        display: block;
-    }
-    .dropdown-item {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 10px 20px;
-        color: #fff;
-        border: none;
-        background: none;
-        width: 100%;
-        transition: background 0.15s;
-    }
-    .dropdown-item:hover {
-        background: #09f2;
-        color: #fff;
-    }
-    .primary-btn, .btn, .outline-btn {
-        padding: 8px 20px;
-        border: none;
-        border-radius: 6px;
-        font-weight: bold;
-        background: linear-gradient(90deg, #0184d3, #096bf6);
-        color: #fff;
-        margin-right: 8px;
-        cursor: pointer;
-        transition: 0.15s;
-        box-shadow: 0 2px 8px #0a3a;
-    }
-    .primary-btn.outline, .outline-btn {
-        background: transparent;
-        color: #09f;
-        border: 2px solid #09f;
-    }
-    .primary-btn:hover, .btn:hover {
-        background: linear-gradient(90deg, #096bf6 50%, #0184d3);
-        color: #fff;
-        transform: translateY(-2px) scale(1.03);
-    }
-    .container-fluid, .container {
-        max-width: 1050px;
-        margin: 0 auto;
-        padding: 24px 16px;
-    }
-    .section-header, .section-title {
-        margin-bottom: 16px;
-        font-size: 1.5rem;
-        color: #09f;
-        font-weight: 700;
-        letter-spacing: 1px;
-    }
-    .story-list {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(170px,1fr));
-        gap: 18px;
-    }
-    .story-item {
-        background: #20222a;
-        border-radius: 7px;
-        overflow: hidden;
-        box-shadow: 0 2px 8px #0006;
-        transition: transform .18s;
-    }
-    .story-item:hover { transform: translateY(-4px) scale(1.03); }
-    .story-item .image img {
-        width: 100%;
-        height: 220px;
-        object-fit: cover;
-        border-bottom: 1px solid #24262b;
-        background: #2a2c33;
-    }
-    .story-item .info {
-        padding: 10px 11px 13px 11px;
-    }
-    .story-item .title {
-        font-size: 1.08rem;
-        font-weight: 600;
-        margin: 0 0 8px 0;
-        color: #fff;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    .story-item .meta {
-        font-size: 0.93rem;
-        color: #aaa;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .notice, .alert {
-        background: #23262f;
-        color: #fff;
-        padding: 13px 16px;
-        border-radius: 5px;
-        margin: 16px 0;
-        font-size: 1rem;
-        border-left: 4px solid #09f;
-    }
-    .notice.warning, .alert-danger { background: #ffb30020; color: #ffc107; border-left-color: #ffc107; }
-    .notice.error { background: #d32f2f26; color: #ff6e6e; border-left-color:#d32f2f;}
-    .notice.success { background: #43a04718; color: #43a047; border-left-color:#43a047;}
-    .auth-form, .form-area {
-        background: #21232b;
-        border-radius: 10px;
-        box-shadow: 0 2px 12px #0007;
-        max-width: 380px;
-        margin: 36px auto;
-        padding: 32px 27px;
-    }
-    .form-title { color: #09f; font-size: 1.3rem; font-weight: bold; margin-bottom: 18px; }
-    .form-group { margin-bottom: 18px; }
-    .form-input, .form-control, select {
-        width: 100%; padding: 10px 12px;
-        border-radius: 6px;
-        border: 1px solid #2e3038;
-        background: #23252b;
-        color: #fff;
-        font-size: 1rem;
-        transition: border 0.18s;
-        outline: none;
-    }
-    .form-input:focus, .form-control:focus, select:focus {
-        border: 1.5px solid #09f;
-        background: #23293b;
-    }
-    .chapter-wrapper, .chapter-list {
-        margin-top: 12px;
-        background: #23242d;
-        border-radius: 7px;
-        padding: 18px 15px;
-        box-shadow: 0 2px 8px #0005;
-    }
-    .chapter-item {
-        padding: 10px 0;
-        border-bottom: 1px solid #31313b;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .chapter-link, .chapter-info .name {
-        color: #fff;
-        font-weight: 500;
-        font-size: 1.06rem;
-        transition: color 0.15s;
-    }
-    .chapter-link:hover { color: #09f; }
-    .profile-info {
-        background: #21232b;
-        border-radius: 10px;
-        padding: 28px 25px;
-        margin: 0 auto;
-        max-width: 400px;
-        box-shadow: 0 2px 10px #0005;
-    }
-    .profile-info .info-item {
-        display: flex;
-        justify-content: space-between;
-        padding: 11px 0;
-        border-bottom: 1px solid #282a33;
-        font-size: 1.08rem;
-    }
-    .profile-info .info-item:last-child { border-bottom: none; }
-    .profile-info .label { color: #aaa; }
-    .profile-info .value { color: #fff; font-weight: 500; }
-    .admin-nav {
-        display: flex; gap: 16px; margin: 20px 0;
-    }
-    .tab-item {
-        font-weight: bold;
-        color: #aaa;
-        background: #232631;
-        padding: 11px 23px;
-        border-radius: 8px 8px 0 0;
-        border-bottom: 2px solid #232631;
-        transition: all .15s;
-    }
-    .tab-item.active, .tab-item:hover {
-        color: #09f;
-        background: #191a1e;
-        border-bottom: 2px solid #09f;
-    }
-    .section-content { background: #21232b; border-radius: 9px; padding: 21px 17px; margin-top: 0;}
-    .list-table, .chapter-wrapper.admin {
-        margin-top: 13px;
-        background: #23242d;
-        border-radius: 7px;
-        padding: 17px 9px;
-    }
-    .list-item, .chapter-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 0;
-        border-bottom: 1px solid #292b33;
-    }
-    .list-item:last-child, .chapter-item:last-child { border-bottom: none; }
-    .item-info { display: flex; gap: 13px; align-items: center;}
-    .item-thumb { width: 55px; height: 72px; object-fit: cover; border-radius: 4px; }
-    .item-title { font-weight: bold; color: #fff; }
-    .item-meta { color: #aaa; }
-    .item-actions, .chapter-actions {
-        display: flex; gap: 8px;
-    }
-    .action-btn {
-        padding: 6px 14px; border-radius: 5px; background: #21232b;
-        color: #09f; border: 1px solid #09f; font-weight: 500;
-        transition: 0.13s;
-    }
-    .action-btn.edit { color: #fff; background: #09f; border: none;}
-    .action-btn.delete { color: #ff5656; border: 1px solid #ff5656; background: #282a32;}
-    .action-btn:hover { background: #09f; color: #fff; }
-    .chapter-content { background: #23242c; border-radius: 10px; padding: 28px 17px; margin-bottom: 20px;}
-    .chapter-title { color: #09f; font-size: 1.4rem; font-weight: bold; margin-bottom: 16px;}
-    .image-list { display: flex; flex-wrap: wrap; gap: 12px; }
-    .image-item img { width: 100%; max-width: 560px; border-radius: 6px; background: #191a1e;}
-    .chapter-nav { margin-top: 18px;}
-    .list-all-comments { background: #22242b; border-radius: 7px; margin-top: 16px; padding: 19px 13px;}
-    .comment-section { background: #23242d; border-radius: 6px; margin-top: 12px; padding: 13px 19px; }
-    .comment-item, .reply-item {
-        display: flex; align-items: flex-start; gap: 11px; margin-bottom: 14px;
-    }
-    .comment-avatar img { width: 40px; height: 40px; border-radius: 50%; background: #222;}
-    .reply-item .comment-avatar img { width: 30px; height: 30px;}
-    .comment-content, .reply-content { background: #1d1e25; border-radius: 7px; padding: 8px 13px; width: 100%;}
-    .comment-header { display: flex; align-items: center; gap: 12px; font-size: 0.93rem;}
-    .comment-username { color: #09f; font-weight: 600;}
-    .comment-time { color: #aaa;}
-    .comment-text { margin-top: 6px; color: #eee;}
-    .comment-actions { margin-top: 8px;}
-    .btn-link { background: none; border: none; color: #09f; cursor: pointer; font-size: 0.92rem;}
-    .reply-form { margin: 10px 0 10px 40px;}
-    .comment-replies { margin-left: 40px; border-left: 2px solid #22293a; padding-left: 15px;}
-    .no-comment { color: #aaa; font-style: italic; margin-top: 10px;}
-    .vip-notice { background: #24273a; border-radius: 7px; padding: 28px 18px; margin: 16px 0;}
-    .vip-notice .chapter-title { color: #f7c500;}
-    .notice.warning, .vip-notice { border-left: 4px solid #f7c500;}
-    .vip-cost { color: #f7c500; font-weight: bold; }
-    .fa-crown.vip { color: #f7c500;}
-    .unlock-box { margin-top: 13px;}
-    .error-text { color: #ff4a4a;}
-    @media (max-width: 700px) {
-        .navbar-area, .container-fluid, .container { padding: 11px 4vw;}
-        .story-list { grid-template-columns: repeat(2, 1fr);}
-        .chapter-wrapper, .chapter-content { padding: 11px 7px;}
-        .auth-form, .form-area, .profile-info { padding: 17px 6vw; }
-    }
-    #loading-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background: rgba(0,0,0,0.8);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    z-index: 9999;
-    transition: opacity 0.3s;
-}
-
-.loading-spinner {
-    text-align: center;
-}
-
-.spinner {
-    width: 50px;
-    height: 50px;
-    border: 3px solid transparent;
-    border-top-color: #09f;
-    border-radius: 50%;
-    animation: spin 1s linear infinite;
-}
-
-.loading-text {
-    color: #fff;
-    margin-top: 10px;
-    font-size: 1.1em;
-}
-
-.vip-notice {
-    position: fixed;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: #1c1e23;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 0 20px rgba(0,0,0,0.5);
-    z-index: 1000;
-    animation: fadeIn 0.3s ease;
-}
-
-.vip-content {
-    text-align: center;
-}
-
-.vip-content h3 {
-    color: #f44336;
-    margin-bottom: 10px;
-}
-
-.notice.error {
-    background: linear-gradient(45deg, #f44336, #d32f2f);
-    color: #fff;
-}
-
-.fade-out {
-    opacity: 0;
-    transition: opacity 0.3s;
-}
-
-@keyframes spin {
-    to { transform: rotate(360deg); }
-}
-
-@keyframes fadeIn {
-    from { opacity: 0; transform: translate(-50%, -60%); }
-    to { opacity: 1; transform: translate(-50%, -50%); }
-}
-.tag-translator { background: #43a047; color: #fff; border-radius: 4px; font-size: 0.88em; padding: 1px 6px; margin-left: 6px;}
-.comment-realm { color:#f7c500; font-size:0.92em; padding-left:4px;}
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: #fff;
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 1rem 0;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+        
+        .navbar {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 2rem;
+        }
+        
+        .logo {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: #fff;
+            text-decoration: none;
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .nav-menu {
+            display: flex;
+            list-style: none;
+            gap: 2rem;
+        }
+        
+        .nav-link {
+            color: #fff;
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 25px;
+            transition: all 0.3s ease;
+        }
+        
+        .nav-link:hover, .nav-link.active {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateY(-2px);
+        }
+        
+        .user-area {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 25px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            transition: all 0.3s ease;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(45deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
+        }
+        
+        .btn-outline {
+            background: transparent;
+            color: #fff;
+            border: 2px solid #fff;
+        }
+        
+        .btn-outline:hover {
+            background: #fff;
+            color: #1e3c72;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        
+        .page-title {
+            font-size: 2.5rem;
+            text-align: center;
+            margin-bottom: 2rem;
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .section-title {
+            font-size: 1.5rem;
+            margin-bottom: 1.5rem;
+            color: #fff;
+            position: relative;
+            padding-left: 1rem;
+        }
+        
+        .section-title::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 4px;
+            height: 100%;
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            border-radius: 2px;
+        }
+        
+        .comic-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 2rem;
+            margin-bottom: 3rem;
+        }
+        
+        .comic-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            overflow: hidden;
+            transition: all 0.3s ease;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .comic-card:hover {
+            transform: translateY(-10px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+        
+        .comic-thumbnail {
+            width: 100%;
+            height: 250px;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .comic-thumbnail img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transition: transform 0.3s ease;
+        }
+        
+        .comic-card:hover .comic-thumbnail img {
+            transform: scale(1.1);
+        }
+        
+        .comic-info {
+            padding: 1rem;
+        }
+        
+        .comic-title {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: #fff;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        
+        .comic-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.875rem;
+            color: rgba(255, 255, 255, 0.7);
+        }
+        
+        .form-container {
+            max-width: 400px;
+            margin: 2rem auto;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 2rem;
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        
+        .form-input {
+            width: 100%;
+            padding: 0.75rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 10px;
+            color: #fff;
+            font-size: 1rem;
+        }
+        
+        .form-input::placeholder {
+            color: rgba(255, 255, 255, 0.6);
+        }
+        
+        .form-input:focus {
+            outline: none;
+            border-color: #4ecdc4;
+            box-shadow: 0 0 10px rgba(78, 205, 196, 0.3);
+        }
+        
+        .notification {
+            padding: 1rem;
+            border-radius: 10px;
+            margin-bottom: 1rem;
+            border-left: 4px solid;
+        }
+        
+        .notification.success {
+            background: rgba(46, 204, 113, 0.2);
+            border-color: #2ecc71;
+            color: #2ecc71;
+        }
+        
+        .notification.error {
+            background: rgba(231, 76, 60, 0.2);
+            border-color: #e74c3c;
+            color: #e74c3c;
+        }
+        
+        .notification.warning {
+            background: rgba(241, 196, 15, 0.2);
+            border-color: #f1c40f;
+            color: #f1c40f;
+        }
+        
+        .chapter-list {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            overflow: hidden;
+        }
+        
+        .chapter-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            transition: background 0.3s ease;
+        }
+        
+        .chapter-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .chapter-link {
+            color: #fff;
+            text-decoration: none;
+            font-weight: 500;
+            flex: 1;
+        }
+        
+        .chapter-link:hover {
+            color: #4ecdc4;
+        }
+        
+        .admin-section {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .admin-nav {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .tab-btn {
+            padding: 0.75rem 1.5rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            border-radius: 10px;
+            color: #fff;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-btn.active {
+            background: linear-gradient(45deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        @media (max-width: 768px) {
+            .navbar {
+                flex-direction: column;
+                gap: 1rem;
+                padding: 1rem;
+            }
+            
+            .nav-menu {
+                gap: 1rem;
+            }
+            
+            .container {
+                padding: 1rem;
+            }
+            
+            .comic-grid {
+                grid-template-columns: repeat(2, 1fr);
+                gap: 1rem;
+            }
+            
+            .page-title {
+                font-size: 2rem;
+            }
+        }
     </style>
 </head>
 <body>
-<header class="header-area">
-    <div class="navbar-area">
-        <a href="?page=home" class="logo">ComicHub</a>
-        <div class="menu-area">
-            <ul class="menu">
-                <li class="menu-item">
-                    <a href="?page=home" class="menu-link'.($page=='home'?' active':'').'">Trang chủ</a>
-                </li>
-                <li class="menu-item">
-                    <a href="?page=fav" class="menu-link'.($page=='fav'?' active':'').'">Theo dõi</a>
-                </li>
-                <li class="menu-item">
-                    <a href="?page=history" class="menu-link'.($page=='history'?' active':'').'">Lịch sử</a>
-                </li>
-            </ul>';
-
-if ($user) {
-    echo '<div class="user-area">
-            <div class="user-toggle" tabindex="0" style="position:relative;">
-                <img src="https://via.placeholder.com/150?text=Avatar" class="avatar">
-                <div class="dropdown-menu" id="menu">
-                    <a href="?page=profile" class="dropdown-item">
-                        <i class="fa-solid fa-user"></i> Thông tin
-                    </a>
-                    <a href="?page=fav" class="dropdown-item">
-                        <i class="fa-solid fa-heart"></i> Theo dõi
-                    </a>
-                    <a href="?page=history" class="dropdown-item">
-                        <i class="fa-solid fa-clock-rotate-left"></i> Lịch sử
-                    </a>';
-    if (in_array($user['role'], ['admin', 'translator'])) {
-        echo '<a href="?page=admin" class="dropdown-item">
-                <i class="fa-solid fa-gear"></i> Quản trị
-              </a>';
-    }
-    echo '<a href="?page=logout" class="dropdown-item">
-            <i class="fa-solid fa-arrow-right-from-bracket"></i> Đăng xuất
-          </a>
-          </div>
-          </div>';
-} else {
-    echo '<div class="auth-area">
-            <a href="?page=login" class="primary-btn outline">Đăng nhập</a>
-            <a href="?page=register" class="primary-btn">Đăng ký</a>
-          </div>';
-}
-echo '</div>
-    </div>
-</header>
-<main class="main-area">
-    <div class="container-fluid">';
-    
-    // ============= TIẾP TỤC XỬ LÝ PAGE ===============
-if ($page == 'home') {
-    echo '<div class="section-header">
-            <h2 class="section-title">Truyện Mới Nhất</h2>
-          </div>';
-    echo '<div class="story-list">';
-    $res = $mysqli->query("SELECT * FROM comics ORDER BY updated_at DESC LIMIT 18");
-    if ($res && $res->num_rows > 0) {
-        while($c = $res->fetch_assoc()) {
-            $thumb = $c['thumbnail'] ?? 'https://via.placeholder.com/200x270?text=No+Image';
-            echo '<div class="story-item">
-                    <a href="?page=comic&id='.$c['id'].'" class="item-link">
-                        <div class="image">
-                            <img src="'.htmlspecialchars($thumb).'" alt="thumb">
-                        </div>
-                        <div class="info">
-                            <h3 class="title">'.htmlspecialchars($c['title']).'</h3>
-                            <div class="meta">
-                                <span class="time">'.date('d/m/Y', strtotime($c['updated_at'])).'</span>
-                            </div>
-                        </div>
-                    </a>
-                  </div>';
-        }
-    } else {
-        echo '<div class="notice warning">Chưa có truyện nào được đăng.</div>';
-    }
-    echo '</div>';
-}
-elseif ($page == 'login') {
-    if ($_POST) {
-        $u = $mysqli->real_escape_string($_POST['username']);
-        $p = md5($_POST['password']);
-        $user_result = $mysqli->query("SELECT * FROM users WHERE username='$u' AND password='$p'")->fetch_assoc();
-        if ($user_result) { 
-            $_SESSION['user_id'] = $user_result['id']; 
-            echo "<script>window.location.href = 'index.php?page=home';</script>";
-            exit;
-        }
-        echo '<div class="notice error">Tên đăng nhập hoặc mật khẩu không đúng!</div>';
-    }
-    echo '<div class="auth-form">
-            <h1 class="form-title">Đăng Nhập</h1>
-            <form method="POST">
-                <div class="form-group">
-                    <input name="username" type="text" class="form-input" placeholder="Tên đăng nhập" required>
-                </div>
-                <div class="form-group">
-                    <input name="password" type="password" class="form-input" placeholder="Mật khẩu" required>
-                </div>
-                <button type="submit" class="primary-btn">Đăng Nhập</button>
-            </form>
-          </div>';
-}
-elseif ($page == 'register') {
-    if ($_POST) {
-        $u = $mysqli->real_escape_string($_POST['username']);
-        $p = md5($_POST['password']);
-        $check = $mysqli->query("SELECT id FROM users WHERE username='$u'")->num_rows;
-        if ($check > 0) {
-            echo '<div class="notice error">Tên đăng nhập đã tồn tại!</div>';
-        } else {
-            $mysqli->query("INSERT INTO users(username,password) VALUES('$u','$p')");
-            echo "<script>window.location.href = 'index.php?page=login';</script>";
-            exit;
-        }
-    }
-    echo '<div class="auth-form">
-            <h1 class="form-title">Đăng Ký</h1>
-            <form method="POST">
-                <div class="form-group">
-                    <input name="username" type="text" class="form-input" placeholder="Tên đăng nhập" required>
-                </div>
-                <div class="form-group">
-                    <input name="password" type="password" class="form-input" placeholder="Mật khẩu" required>
-                </div>
-                <button type="submit" class="primary-btn">Đăng Ký</button>
-            </form>
-          </div>';
-}
-elseif ($page == 'logout') { 
-    unset($_SESSION['user_id']); 
-    echo "<script>window.location.href = 'index.php?page=home';</script>";
-    exit; 
-}
-elseif ($page == 'fav') {
-    echo '<div class="section-header">
-            <h2 class="section-title">Danh Sách Theo Dõi</h2>
-          </div>';
-    if (!$user) {
-        echo '<div class="notice warning">Bạn cần đăng nhập để xem danh sách theo dõi.</div>';
-    } else {
-        $res = $mysqli->query("SELECT comics.* FROM user_favorites 
-            JOIN comics ON comics.id = user_favorites.comic_id 
-            WHERE user_favorites.user_id = {$user['id']}");
-        if ($res && $res->num_rows > 0) {
-            echo '<div class="story-list">';
-            while($c = $res->fetch_assoc()) {
-                $thumb = $c['thumbnail'] ?? 'https://via.placeholder.com/200x270?text=No+Image';
-                echo '<div class="story-item">
-                        <a href="?page=comic&id='.$c['id'].'" class="item-link">
-                            <div class="image">
-                                <img src="'.htmlspecialchars($thumb).'" alt="thumb">
-                            </div>
-                            <div class="info">
-                                <h3 class="title">'.htmlspecialchars($c['title']).'</h3>
-                                <div class="meta">
-                                    <span class="time">'.date('d/m/Y', strtotime($c['updated_at'])).'</span>
-                                </div>
-                            </div>
-                        </a>
-                      </div>';
-            }
-            echo '</div>';
-        } else {
-            echo '<div class="notice warning">Bạn chưa theo dõi truyện nào.</div>';
-        }
-    }
-}
-elseif ($page == 'history') {
-    echo '<div class="section-header">
-            <h2 class="section-title">Lịch Sử Đọc</h2>
-          </div>';
-    if (!$user) {
-        echo '<div class="notice warning">Bạn cần đăng nhập để xem lịch sử đọc.</div>';
-    } else {
-        $res = $mysqli->query(
-            "SELECT chapters.id as ch_id, chapters.chapter_title, chapters.comic_id, comics.title AS comic_title, read_history.updated_at
-            FROM read_history 
-            JOIN chapters ON chapters.id = read_history.chapter_id
-            JOIN comics ON comics.id = chapters.comic_id
-            WHERE read_history.user_id = {$user['id']}
-            ORDER BY read_history.updated_at DESC LIMIT 50"
-        );
-        if ($res && $res->num_rows > 0) {
-            echo '<div class="chapter-wrapper">';
-            while($r = $res->fetch_assoc()) {
-                echo '<div class="chapter-item">
-                        <a href="?page=chapter&id='.$r['ch_id'].'" class="chapter-link">
-                            <span class="name">'.$r['comic_title'].' - '.$r['chapter_title'].'</span>
-                            <span class="time">'.date('d/m/Y H:i', strtotime($r['updated_at'])).'</span>
-                        </a>
-                      </div>';
-            }
-            echo '</div>';
-        } else {
-            echo '<div class="notice warning">Bạn chưa đọc chương nào.</div>';
-        }
-    }
-}
-elseif ($page == 'profile') {
-    echo '<div class="section-header">
-            <h2 class="section-title">Thông Tin Cá Nhân</h2>
-          </div>';
-    echo '<div class="profile-info">
-            <div class="info-item">
-                <span class="label">Tên đăng nhập:</span>
-                <span class="value">'.htmlspecialchars($user['username']).'</span>
+    <header class="header">
+        <nav class="navbar">
+            <a href="?page=home" class="logo">🌟 MangaHub</a>
+            <ul class="nav-menu">
+                <li><a href="?page=home" class="nav-link <?php echo $page == 'home' ? 'active' : ''; ?>">Trang chủ</a></li>
+                <li><a href="?page=favorites" class="nav-link <?php echo $page == 'favorites' ? 'active' : ''; ?>">Theo dõi</a></li>
+                <li><a href="?page=history" class="nav-link <?php echo $page == 'history' ? 'active' : ''; ?>">Lịch sử</a></li>
+                <?php if ($user && in_array($user['role'], ['admin', 'translator'])): ?>
+                <li><a href="?page=admin" class="nav-link <?php echo $page == 'admin' ? 'active' : ''; ?>">Quản trị</a></li>
+                <?php endif; ?>
+            </ul>
+            <div class="user-area">
+                <?php if ($user): ?>
+                    <span>Xin chào, <?php echo sanitize($user['username']); ?>!</span>
+                    <a href="?page=profile" class="btn btn-outline">Tài khoản</a>
+                    <a href="?page=logout" class="btn btn-primary">Đăng xuất</a>
+                <?php else: ?>
+                    <a href="?page=login" class="btn btn-outline">Đăng nhập</a>
+                    <a href="?page=register" class="btn btn-primary">Đăng ký</a>
+                <?php endif; ?>
             </div>
-            <div class="info-item">
-                <span class="label">Vai trò:</span>
-                <span class="value">'.ucfirst($user['role']).'</span>
-            </div>
-            <div class="info-item">
-                <span class="label">Số xu:</span>
-                <span class="value">'.number_format($user['coins'] ?? 0).' xu</span>
-            </div>
- <div class="info-item">
-    <span class="label">Cảnh giới:</span>
-    <span class="value">'.htmlspecialchars($user['realm']).' - '.($user['realm_stage']==10?'Đỉnh phong':$user['realm_stage']).'/10</span>
-          </div>';
-}
-// ... (TIẾP: admin, comic, chapter page và JS cuối file)
-elseif ($page == 'admin') {
-    requireRole(['admin','translator']);
-    echo '<div class="section-header">
-            <h2 class="section-title">Quản Lý Hệ Thống</h2>
-          </div>';
-    $action = $_GET['action'] ?? '';
-    echo '<div class="admin-nav">
-            <a href="?page=admin&action=comic" class="tab-item '.($action=='comic'?'active':'').'">Quản lý truyện</a>
-            <a href="?page=admin&action=chapter" class="tab-item '.($action=='chapter'?'active':'').'">Quản lý chương</a>
-          </div>';
-    if ($action == 'comic') {
-        echo '<div class="section-content">';
-        if ($_POST && isset($_POST['title'])) {
-            $title = $mysqli->real_escape_string($_POST['title']);
-            $description = $mysqli->real_escape_string($_POST['description'] ?? '');
-            $thumbnail = $mysqli->real_escape_string($_POST['thumbnail'] ?? '');
-            $author = $mysqli->real_escape_string($_POST['author'] ?? '');
-            $status = $mysqli->real_escape_string($_POST['status'] ?? '');
-            $genres = $mysqli->real_escape_string($_POST['genres'] ?? '');
-            $mysqli->query("INSERT INTO comics(title,description,thumbnail,author,status,genres,created_by) 
-                          VALUES('$title','$description','$thumbnail','$author','$status','$genres',{$user['id']})");
-            echo '<div class="notice success">Đã thêm truyện mới!</div>';
-        }
-        echo '<form method="POST" class="form-area">
-                <div class="form-group">
-                    <input name="title" class="form-input" placeholder="Tên truyện" required>
-                </div>
-                <div class="form-group">
-                    <input name="author" class="form-input" placeholder="Tác giả">
-                </div>
-                <div class="form-group">
-                    <input name="thumbnail" class="form-input" placeholder="Link ảnh bìa (nên có)">
-                </div>
-                <div class="form-group">
-                    <select name="status" class="form-input">
-                        <option value="ongoing">Đang tiến hành</option>
-                        <option value="completed">Hoàn thành</option>
-                        <option value="dropped">Tạm ngưng</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <input name="genres" class="form-input" placeholder="Thể loại (ngăn cách bằng dấu phẩy)">
-                </div>
-                <div class="form-group">
-                    <textarea name="description" class="form-input" placeholder="Mô tả truyện" rows="4"></textarea>
-                </div>
-                <button type="submit" class="primary-btn">Thêm Truyện</button>
-              </form>';
-        $query = $user['role'] === 'admin' ? 
-                "SELECT * FROM comics ORDER BY id DESC" : 
-                "SELECT * FROM comics WHERE created_by={$user['id']} ORDER BY id DESC";
-        $res = $mysqli->query($query);
-        if ($res && $res->num_rows > 0) {
-            echo '<div class="list-table">';
-            while($r = $res->fetch_assoc()) {
-                $thumb = $r['thumbnail'] ?? 'https://via.placeholder.com/100x130?text=No+Image';
-                echo '<div class="list-item">
-                        <div class="item-info">
-                            <img src="'.htmlspecialchars($thumb).'" alt="thumb" class="item-thumb">
-                            <div class="item-detail">
-                                <h4 class="item-title">'.htmlspecialchars($r['title']).'</h4>
-                                <p class="item-meta">'.htmlspecialchars($r['author'] ?: 'Chưa có tác giả').'</p>
-                            </div>
-                        </div>
-                        <div class="item-actions">
-                            <a href="?page=admin&action=edit&id='.$r['id'].'" class="action-btn edit">Sửa</a>
-                            <a href="?page=admin&action=chapter&comic='.$r['id'].'" class="action-btn">Chương</a>
-                            <a href="?page=admin&action=del&id='.$r['id'].'" class="action-btn delete" 
-                               onclick="return confirm(\'Bạn có chắc muốn xóa?\')">Xóa</a>
-                        </div>
-                      </div>';
-            }
-            echo '</div>';
-        }
-        echo '</div>';
-    }
-    elseif ($action == 'chapter') {
-        $comic_id = isset($_GET['comic']) ? (int)$_GET['comic'] : 0;
-        echo '<div class="section-content">';
-        if ($comic_id) {
-            $comic = $mysqli->query("SELECT title FROM comics WHERE id=$comic_id")->fetch_assoc();
-            echo '<div class="section-header">
-                    <h3 class="section-title">Quản Lý Chương: '.htmlspecialchars($comic['title']).'</h3>
-                  </div>';
-        }
-        if ($_POST && isset($_POST['comic_id'])) {
-            $post_comic_id = (int)$_POST['comic_id'];
-            $title = $mysqli->real_escape_string($_POST['title']);
-            $is_vip = isset($_POST['is_vip']) ? 1 : 0;
-            $coins = (int)($_POST['coins_unlock'] ?? 0);
-            $images = isset($_POST['images']) ? json_encode(array_filter(explode("\n", $_POST['images']))) : '[]';
-            $mysqli->query("INSERT INTO chapters(comic_id,chapter_title,is_vip,coins_unlock,images) 
-                          VALUES($post_comic_id,'$title',$is_vip,$coins,'$images')");
-            echo '<div class="notice success">Đã thêm chương mới!</div>';
-        }
-        $comic_query = $user['role'] === 'admin' ? 
-                      "SELECT * FROM comics" : 
-                      "SELECT * FROM comics WHERE created_by={$user['id']}";
-        $comics = $mysqli->query($comic_query);
-        echo '<form method="POST" class="form-area">
-                <div class="form-group">
-                    <select name="comic_id" class="form-input" required '.($comic_id ? 'disabled' : '').'>
-                        <option value="">Chọn truyện</option>';
-        if ($comics) {
-            while($comic = $comics->fetch_assoc()) {
-                $selected = $comic_id == $comic['id'] ? 'selected' : '';
-                echo '<option value="'.$comic['id'].'" '.$selected.'>'.htmlspecialchars($comic['title']).'</option>';
-            }
-        }
-        echo '</select>';
-        if ($comic_id) {
-            echo '<input type="hidden" name="comic_id" value="'.$comic_id.'">';
-        }
-        echo '</div>
-              <div class="form-group">
-                <input name="title" class="form-input" placeholder="Tên chương" required>
-              </div>
-              <div class="form-group">
-                <label class="checkbox-label">
-                    <input type="checkbox" name="is_vip" value="1" class="checkbox-input" 
-                           onchange="document.getElementById(\'coins\').style.display=this.checked?\'block\':\'none\'">
-                    <span class="checkbox-text">Chương VIP</span>
-                </label>
-              </div>
-              <div id="coins" class="form-group" style="display:none">
-                <input name="coins_unlock" type="number" class="form-input" placeholder="Số xu cần để mở khóa" min="0">
-              </div>
-              <div class="form-group">
-                <textarea name="images" class="form-input" placeholder="Link ảnh mỗi dòng một link" rows="5"></textarea>
-              </div>
-              <button type="submit" class="primary-btn">Thêm Chương</button>
-            </form>';
-        $chapter_query = "SELECT chapters.*, comics.title AS comic_title 
-                         FROM chapters 
-                         JOIN comics ON comics.id = chapters.comic_id 
-                         WHERE " . ($comic_id ? "chapters.comic_id = $comic_id AND " : "") . 
-                         "(comics.created_by = {$user['id']} OR '{$user['role']}' = 'admin') 
-                         ORDER BY chapters.id DESC";
-        $res = $mysqli->query($chapter_query);
-        if ($res && $res->num_rows > 0) {
-            echo '<div class="chapter-wrapper admin">';
-            while($r = $res->fetch_assoc()) {
-                echo '<div class="chapter-item">
-                        <div class="chapter-info">
-                            <span class="name">'.($comic_id ? '' : htmlspecialchars($r['comic_title']).' - ').
-                            htmlspecialchars($r['chapter_title']).
-                            ($r['is_vip'] ? ' <i class="fa-solid fa-crown vip"></i>' : '').'</span>
-                            '.($r['is_vip'] ? '<span class="vip-cost">'.$r['coins_unlock'].' xu</span>' : '').'
-                        </div>
-                        <div class="chapter-actions">
-                            <a href="?page=chapter&id='.$r['id'].'" class="action-btn">Xem</a>
-                            <a href="?page=admin&action=edit_chapter&id='.$r['id'].'" class="action-btn edit">Sửa</a>
-                            <a href="?page=admin&action=del_chapter&id='.$r['id'].'" class="action-btn delete" 
-                               onclick="return confirm(\'Bạn có chắc muốn xóa?\')">Xóa</a>
-                        </div>
-                      </div>';
-            }
-            echo '</div>';
-        }
-        echo '</div>';
-    }
-    elseif ($action == 'edit') {
-        $id = (int)$_GET['id'];
-        if ($_POST && isset($_POST['title'])) {
-            $title = $mysqli->real_escape_string($_POST['title']);
-            $description = $mysqli->real_escape_string($_POST['description'] ?? '');
-            $thumbnail = $mysqli->real_escape_string($_POST['thumbnail'] ?? '');
-            $author = $mysqli->real_escape_string($_POST['author'] ?? '');
-            $status = $mysqli->real_escape_string($_POST['status'] ?? '');
-            $genres = $mysqli->real_escape_string($_POST['genres'] ?? '');
-            $mysqli->query("UPDATE comics SET 
-                          title='$title', 
-                          description='$description', 
-                          thumbnail='$thumbnail',
-                          author='$author',
-                          status='$status',
-                          genres='$genres'
-                          WHERE id=$id");
-            echo '<div class="notice success">Đã cập nhật truyện!</div>';
-        }
-        $c = $mysqli->query("SELECT * FROM comics WHERE id=$id")->fetch_assoc();
-        if ($c) {
-            echo '<div class="section-content">
-                    <h3 class="section-title">Sửa Truyện</h3>
-                    <form method="POST" class="form-area">
-                        <div class="form-group">
-                            <input name="title" class="form-input" value="'.htmlspecialchars($c['title']).'" required>
-                        </div>
-                        <div class="form-group">
-                            <input name="author" class="form-input" value="'.htmlspecialchars($c['author'] ?? '').'" placeholder="Tác giả">
-                        </div>
-                        <div class="form-group">
-                            <input name="thumbnail" class="form-input" value="'.htmlspecialchars($c['thumbnail'] ?? '').'" placeholder="Link ảnh bìa">
-                        </div>
-                        <div class="form-group">
-                            <select name="status" class="form-input">
-                                <option value="ongoing" '.($c['status']=='ongoing'?'selected':'').'>Đang tiến hành</option>
-                                <option value="completed" '.($c['status']=='completed'?'selected':'').'>Hoàn thành</option>
-                                <option value="dropped" '.($c['status']=='dropped'?'selected':'').'>Tạm ngưng</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <input name="genres" class="form-input" value="'.htmlspecialchars($c['genres'] ?? '').'" placeholder="Thể loại (ngăn cách bằng dấu phẩy)">
-                        </div>
-                        <div class="form-group">
-                            <textarea name="description" class="form-input" placeholder="Mô tả truyện" rows="4">'.htmlspecialchars($c['description'] ?? '').'</textarea>
-                        </div>
-                        <div class="form-actions">
-                            <button type="submit" class="primary-btn">Cập Nhật</button>
-                            <a href="?page=admin&action=comic" class="outline-btn">Hủy</a>
-                        </div>
-                    </form>
-                  </div>';
-        }
-    }
-    elseif ($action == 'edit_chapter') {
-        $id = (int)$_GET['id'];
-        if ($_POST && isset($_POST['title'])) {
-            $title = $mysqli->real_escape_string($_POST['title']);
-            $is_vip = isset($_POST['is_vip']) ? 1 : 0;
-            $coins = (int)($_POST['coins_unlock'] ?? 0);
-            $images = isset($_POST['images']) ? json_encode(array_filter(explode("\n", $_POST['images']))) : '[]';
-            $mysqli->query("UPDATE chapters SET 
-                          chapter_title='$title',
-                          is_vip=$is_vip,
-                          coins_unlock=$coins,
-                          images='$images'
-                          WHERE id=$id");
-            echo '<div class="notice success">Đã cập nhật chương!</div>';
-        }
-        $ch = $mysqli->query("SELECT chapters.*, comics.title AS comic_title 
-                            FROM chapters 
-                            JOIN comics ON comics.id = chapters.comic_id 
-                            WHERE chapters.id=$id")->fetch_assoc();
-        if ($ch) {
-            echo '<div class="section-content">
-                    <h3 class="section-title">Sửa Chương: '.htmlspecialchars($ch['comic_title']).'</h3>
-                    <form method="POST" class="form-area">
-                        <div class="form-group">
-                            <input name="title" class="form-input" value="'.htmlspecialchars($ch['chapter_title']).'" required>
-                        </div>
-                        <div class="form-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" name="is_vip" value="1" class="checkbox-input" '.($ch['is_vip']?'checked':'').'
-                                       onchange="document.getElementById(\'coins\').style.display=this.checked?\'block\':\'none\'">
-                                <span class="checkbox-text">Chương VIP</span>
-                            </label>
-                        </div>
-                        <div id="coins" class="form-group" style="display:'.($ch['is_vip']?'block':'none').'">
-                            <input name="coins_unlock" type="number" class="form-input" value="'.$ch['coins_unlock'].'" 
-                                   placeholder="Số xu cần để mở khóa" min="0">
-                        </div>
-                        <div class="form-group">
-                            <textarea name="images" class="form-input" placeholder="Link ảnh mỗi dòng một link" rows="5">'.
-                            implode("\n", json_decode($ch['images'] ?? '[]', true)).'</textarea>
-                        </div>
-                        <div class="form-actions">
-                            <button type="submit" class="primary-btn">Cập Nhật</button>
-                            <a href="?page=admin&action=chapter&comic='.$ch['comic_id'].'" class="outline-btn">Hủy</a>
-                        </div>
-                    </form>
-                  </div>';
-        }
-    }
-    elseif ($action == 'del') {
-        $id = (int)$_GET['id'];
-        $mysqli->query("DELETE FROM comics WHERE id=$id");
-        echo '<div class="notice success">Đã xóa truyện!</div>';
-        echo '<script>setTimeout(() => window.location.href="?page=admin&action=comic", 1500);</script>';
-    }
-    elseif ($action == 'del_chapter') {
-        $id = (int)$_GET['id'];
-        $ch = $mysqli->query("SELECT comic_id FROM chapters WHERE id=$id")->fetch_assoc();
-        $mysqli->query("DELETE FROM chapters WHERE id=$id");
-        echo '<div class="notice success">Đã xóa chương!</div>';
-        echo '<script>setTimeout(() => window.location.href="?page=admin&action=chapter&comic='.$ch['comic_id'].'", 1500);</script>';
-    }
-}
-elseif ($page == 'comic') {
-    $id = (int)$_GET['id'];
-    $c = $mysqli->query("SELECT * FROM comics WHERE id=$id")->fetch_assoc();
-    if (!$c) {
-        echo '<div class="alert alert-danger">Không tìm thấy truyện!</div>';
-    } else {
-        // Update view count
-        $mysqli->query("UPDATE comics SET views=views+1 WHERE id=$id");
-        $c['views']++;
-        // Handle follow/unfollow
-        if ($user && isset($_GET['follow'])) {
-            $isFollowed = $mysqli->query("SELECT 1 FROM user_favorites WHERE user_id={$user['id']} AND comic_id=$id")->num_rows;
-            if ($_GET['follow'] == '1' && !$isFollowed) {
-                $mysqli->query("INSERT IGNORE INTO user_favorites(user_id, comic_id) VALUES({$user['id']}, $id)");
-                $mysqli->query("UPDATE comics SET follows=follows+1 WHERE id=$id");
-                echo "<script>window.location.href='?page=comic&id=$id';</script>";
-                exit;
-            }
-            if ($_GET['follow'] == '0' && $isFollowed) {
-                $mysqli->query("DELETE FROM user_favorites WHERE user_id={$user['id']} AND comic_id=$id");
-                $mysqli->query("UPDATE comics SET follows=GREATEST(follows-1,0) WHERE id=$id");
-                echo "<script>window.location.href='?page=comic&id=$id';</script>";
-                exit;
-            }
-        }
-        $isFollowed = $user ? $mysqli->query("SELECT 1 FROM user_favorites WHERE user_id={$user['id']} AND comic_id=$id")->num_rows : false;
-        // Handle rating
-        if ($user && isset($_POST['rating']) && is_numeric($_POST['rating']) && $_POST['rating'] >= 1 && $_POST['rating'] <= 5) {
-            $rating = intval($_POST['rating']);
-            $old = $mysqli->query("SELECT rating FROM comic_ratings WHERE user_id={$user['id']} AND comic_id=$id")->fetch_assoc();
-            if ($old) {
-                $mysqli->query("UPDATE comic_ratings SET rating=$rating WHERE user_id={$user['id']} AND comic_id=$id");
-            } else {
-                $mysqli->query("INSERT INTO comic_ratings (user_id, comic_id, rating) VALUES ({$user['id']}, $id, $rating)");
-            }
-            $avg = $mysqli->query("SELECT AVG(rating) as avg, COUNT(*) as cnt FROM comic_ratings WHERE comic_id=$id")->fetch_assoc();
-            $mysqli->query("UPDATE comics SET rating=".round($avg['avg'],2).", total_rating={$avg['cnt']} WHERE id=$id");
-            $c['rating'] = round($avg['avg'], 2);
-            $c['total_rating'] = $avg['cnt'];
-        }
-        $rating_avg = $c['total_rating'] > 0 ? round($c['rating'],1) : 0;
-        $rating_count = intval($c['total_rating']);
-        $userRating = ($user) ? getUserComicRating($user['id'], $id) : 0;
+        </nav>
+    </header>
 
-        echo '<div class="section-header">
-                <h2 class="section-title">'.htmlspecialchars($c['title']).'</h2>
-              </div>';
-        echo '<div class="chapter-content">';
-        echo '<div style="display: flex;flex-wrap:wrap;gap:20px">';
-        echo '<div style="min-width:200px;max-width:230px;"><img src="'.htmlspecialchars($c['thumbnail'] ?? 'https://via.placeholder.com/200x270?text=No+Image').'" style="width:100%;border-radius:8px;background:#222;"></div>';
-        echo '<div style="flex:1 1 240px">';
-        echo '<div><b>Tác giả:</b> '.htmlspecialchars($c['author'] ?: 'Đang cập nhật').'</div>';
-        echo '<div><b>Trạng thái:</b> '.ucfirst($c['status']).'</div>';
-        echo '<div><b>Lượt xem:</b> '.number_format($c['views']).'</div>';
-        echo '<div><b>Lượt theo dõi:</b> '.number_format($c['follows']).'</div>';
-        echo '<div><b>Thể loại:</b> '.htmlspecialchars($c['genres']).'</div>';
-        echo '<div><b>Đánh giá:</b> <span style="color:#f7c500">'.($rating_avg).'</span> ('.($rating_count).' lượt)';
-        if ($user) {
-            echo '<form method="POST" style="display:inline-block;margin-left:10px;">
-            <select name="rating" class="form-input" style="display:inline-block;width:auto;height:30px;padding:0 10px;vertical-align:middle;">';
-            for($i=1;$i<=5;$i++) echo '<option '.($userRating==$i?'selected':'').' value="'.$i.'">'.$i.'</option>';
-            echo '</select>
-            <button type="submit" class="primary-btn" style="padding:4px 10px">Đánh giá</button>
-            </form>';
-        }
-        echo '</div>';
-        echo '</div></div>';
-        echo '<div style="margin-top:20px"><b>Mô tả:</b> '.nl2br(htmlspecialchars($c['description'])).'</div>';
-        if ($user) {
-            if ($isFollowed) {
-                echo '<a href="?page=comic&id='.$id.'&follow=0" class="btn unfollow-btn">Bỏ theo dõi</a>';
-            } else {
-                echo '<a href="?page=comic&id='.$id.'&follow=1" class="btn follow-btn">Theo dõi</a>';
-            }
-        } else {
-            echo '<a href="?page=login" class="btn follow-btn">Theo dõi</a>';
-        }
-        echo '</div>';
-
-        // Danh sách chương
-        echo '<div class="section-header"><h2 class="section-title">Danh Sách Chương</h2></div>';
-        $chapters = $mysqli->query("SELECT * FROM chapters WHERE comic_id=$id ORDER BY id DESC");
-        if ($chapters && $chapters->num_rows > 0) {
-            echo '<div class="chapter-wrapper">';
-            while($ch = $chapters->fetch_assoc()) {
-                echo '<div class="chapter-item">
-                        <a href="?page=chapter&id='.$ch['id'].'" class="chapter-link">
-                            <span class="name">'.$ch['chapter_title'].'</span>
-                            <span class="time">'.getTimeAgo($ch['created_at']).'</span>
-                        </a>
-                      </div>';
-            }
-            echo '</div>';
-        } else {
-            echo '<div class="notice warning">Chưa có chương nào.</div>';
-        }
-
-       echo '<div class="section-header" style="margin-top:25px"><h2 class="section-title">Bình luận</h2></div>';
-        echo '<div class="comment-section">';
-        if ($user) {
-            echo '<form method="POST">
-                    <input type="hidden" name="csrf_token" value="'.$_SESSION['csrf_token'].'">
-                    <textarea name="content" class="form-input" rows="2" placeholder="Nội dung bình luận..." required></textarea>
-                    <button type="submit" name="post_comment" class="primary-btn">Bình luận</button>
-                  </form>';
-            // Xử lý gửi bình luận mới
-            if (isset($_POST['post_comment']) && validateCSRFToken($_POST['csrf_token'])) {
-                $content = trim($_POST['content']);
-                if ($content !== '') {
-                    $check = canPostComment($user['id']);
-                    if ($check['allowed']) {
-                        $mysqli->query("INSERT INTO comments(user_id,comic_id,content,created_at) VALUES ({$user['id']},$id,'".$mysqli->real_escape_string($content)."',NOW())");
-                        echo '<div class="notice success">Đã đăng bình luận.</div><script>setTimeout(()=>location.reload(),800);</script>';
-                    } else {
-                        echo '<div class="notice warning">'.$check['message'].'</div>';
+    <main class="container">
+        <?php
+        // Handle different pages
+        switch ($page) {
+            case 'home':
+                echo '<h1 class="page-title">Truyện Mới Nhất</h1>';
+                echo '<div class="comic-grid">';
+                
+                $comics = $mysqli->query("SELECT * FROM comics ORDER BY updated_at DESC LIMIT 20");
+                if ($comics && $comics->num_rows > 0) {
+                    while ($comic = $comics->fetch_assoc()) {
+                        $thumbnail = $comic['thumbnail'] ?: 'https://via.placeholder.com/200x250?text=No+Image';
+                        echo '<div class="comic-card">
+                                <a href="?page=comic&id=' . $comic['id'] . '">
+                                    <div class="comic-thumbnail">
+                                        <img src="' . sanitize($thumbnail) . '" alt="' . sanitize($comic['title']) . '">
+                                    </div>
+                                    <div class="comic-info">
+                                        <h3 class="comic-title">' . sanitize($comic['title']) . '</h3>
+                                        <div class="comic-meta">
+                                            <span>' . sanitize($comic['author'] ?: 'Chưa rõ') . '</span>
+                                            <span>' . number_format($comic['views']) . ' lượt xem</span>
+                                        </div>
+                                    </div>
+                                </a>
+                              </div>';
                     }
-                }
-            }
-            // Xử lý gửi trả lời bình luận
-            if (isset($_POST['post_reply']) && validateCSRFToken($_POST['csrf_token'])) {
-                $reply_content = trim($_POST['reply_content']);
-                $parent_id = (int)$_POST['parent_id'];
-                if ($reply_content !== '' && $parent_id > 0) {
-                    $check = canPostComment($user['id']);
-                    if ($check['allowed']) {
-                        $mysqli->query("INSERT INTO comments(user_id,comic_id,parent_id,content,created_at) VALUES ({$user['id']},$id,$parent_id,'".$mysqli->real_escape_string($reply_content)."',NOW())");
-                        echo '<div class="notice success">Đã trả lời bình luận.</div><script>setTimeout(()=>location.reload(),800);</script>';
-                    } else {
-                        echo '<div class="notice warning">'.$check['message'].'</div>';
-                    }
-                }
-            }
-        } else {
-            echo '<div class="notice warning">Bạn cần <a href="?page=login">đăng nhập</a> để bình luận.</div>';
-        }
-        displayComments($id);
-        echo '</div>'; // comment-section
-    }
-}
-
-elseif ($page == 'chapter') {
-    if (!$user) {
-        echo '<div class="notice warning">Bạn cần <a href="?page=login">đăng nhập</a> để đọc chương.</div>';
-    } else {
-        $id = (int)$_GET['id'];
-        $ch = $mysqli->query("SELECT chapters.*, comics.title as comic_title, comics.id as comic_id 
-                            FROM chapters 
-                            JOIN comics ON comics.id = chapters.comic_id 
-                            WHERE chapters.id=$id")->fetch_assoc();
-        if (!$ch) {
-            echo '<div class="notice error">Không tìm thấy chương!</div>';
-        } else {
-            // Tăng view chương
-            increaseChapterView($id);
-            // Thêm lịch sử đọc
-            addHistory($user['id'], $id);
-            // Xử lý tăng cấp cảnh giới
-            handleLevelUp($user['id']);
-
-            // Kiểm tra mở khóa
-            $unlock = $ch['is_vip'] ? 
-                     $mysqli->query("SELECT 1 FROM chapter_unlocks WHERE user_id={$user['id']} AND chapter_id=$id")->num_rows : 
-                     true;
-
-            if ($ch['is_vip'] && !$unlock) {
-                if (!isset($_POST['unlock'])) {
-                    echo '<div class="vip-notice">
-                            <h1 class="chapter-title">'.htmlspecialchars($ch['comic_title']).' - '.htmlspecialchars($ch['chapter_title']).' <span class="fa-crown vip">👑</span></h1>
-                            <div class="notice warning">Chương VIP - Cần mở khóa để đọc</div>
-                            <div class="unlock-box">
-                                <p>Chương này yêu cầu <strong>'.$ch['coins_unlock'].' xu</strong> để mở khóa.</p>
-                                <p>Bạn hiện có: <strong>'.($user['coins'] ?? 0).' xu</strong></p>';
-                    if (($user['coins'] ?? 0) >= $ch['coins_unlock']) {
-                        echo '<form method="POST">
-                                <button type="submit" name="unlock" class="primary-btn">
-                                    <span class="fa-unlock">🔓</span> Mở khóa chương
-                                </button>
-                              </form>';
-                    } else {
-                        echo '<p class="error-text">Không đủ xu để mở khóa chương này.</p>';
-                    }
-                    echo '</div>
-                          </div>';
                 } else {
-                    if (($user['coins'] ?? 0) < $ch['coins_unlock']) {
-                        echo '<div class="notice error">Không đủ xu để mở khóa chương này.</div>';
-                    } else {
-                        $mysqli->query("UPDATE users SET coins = coins - {$ch['coins_unlock']} WHERE id = {$user['id']}");
-                        $mysqli->query("INSERT INTO chapter_unlocks (user_id, chapter_id) VALUES ({$user['id']}, $id)");
-                        echo '<div class="notice success">Đã mở khóa chương thành công!</div>';
-                        echo '<script>setTimeout(() => window.location.reload(), 1500);</script>';
-                    }
+                    echo '<div class="notification warning">Chưa có truyện nào được đăng.</div>';
                 }
-            } else {
-                // Nội dung chương
-                displayChapterContent($ch);
+                echo '</div>';
+                break;
 
-                // Điều hướng chương
-                $prev = getPrevChapter($ch['comic_id'], $ch['id']);
-                $next = getNextChapter($ch['comic_id'], $ch['id']);
-                echo "<div class='chapter-nav'>";
-                if ($prev) echo "<a href='?page=chapter&id=$prev' class='primary-btn outline'>← Chương trước</a>";
-                if ($next) echo "<a href='?page=chapter&id=$next' class='primary-btn'>Chương sau →</a>";
-                echo "</div>";
+            case 'login':
+                if ($_POST) {
+                    $username = sanitize($_POST['username']);
+                    $password = $_POST['password'];
+                    
+                    $stmt = $mysqli->prepare("SELECT * FROM users WHERE username = ? OR email = ?");
+                    $stmt->bind_param("ss", $username, $username);
+                    $stmt->execute();
+                    $result = $stmt->get_result();
+                    
+                    if ($result && $result->num_rows > 0) {
+                        $user_data = $result->fetch_assoc();
+                        if (password_verify($password, $user_data['password'])) {
+                            $_SESSION['user_id'] = $user_data['id'];
+                            echo '<script>window.location.href = "?page=home";</script>';
+                            exit;
+                        }
+                    }
+                    echo '<div class="notification error">Tên đăng nhập hoặc mật khẩu không đúng!</div>';
+                }
+                
+                echo '<div class="form-container">
+                        <h2 class="section-title">Đăng Nhập</h2>
+                        <form method="POST">
+                            <div class="form-group">
+                                <input name="username" type="text" class="form-input" placeholder="Tên đăng nhập hoặc email" required>
+                            </div>
+                            <div class="form-group">
+                                <input name="password" type="password" class="form-input" placeholder="Mật khẩu" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary">Đăng Nhập</button>
+                        </form>
+                      </div>';
+                break;
 
-                // Tải trước ảnh chương sau (nếu có)
-                if ($next) {
-                    $chNext = $mysqli->query("SELECT images FROM chapters WHERE id=$next")->fetch_assoc();
-                    if ($chNext && $chNext['images']) {
-                        $imgs = json_decode($chNext['images'], true);
-                        if ($imgs && is_array($imgs)) {
-                            echo "<div style='display:none'>";
-                            foreach ($imgs as $img) {
-                                echo "<img src='".htmlspecialchars($img)."' loading='lazy'>";
+            case 'register':
+                if ($_POST) {
+                    $username = sanitize($_POST['username']);
+                    $email = sanitize($_POST['email']);
+                    $password = $_POST['password'];
+                    
+                    if (strlen($username) < 3) {
+                        echo '<div class="notification error">Tên đăng nhập phải có ít nhất 3 ký tự!</div>';
+                    } elseif (strlen($password) < 6) {
+                        echo '<div class="notification error">Mật khẩu phải có ít nhất 6 ký tự!</div>';
+                    } else {
+                        $check = $mysqli->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
+                        $check->bind_param("ss", $username, $email);
+                        $check->execute();
+                        
+                        if ($check->get_result()->num_rows > 0) {
+                            echo '<div class="notification error">Tên đăng nhập hoặc email đã tồn tại!</div>';
+                        } else {
+                            $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+                            $stmt = $mysqli->prepare("INSERT INTO users (username, email, password) VALUES (?, ?, ?)");
+                            $stmt->bind_param("sss", $username, $email, $hashed_password);
+                            
+                            if ($stmt->execute()) {
+                                echo '<div class="notification success">Đăng ký thành công! Hãy đăng nhập.</div>';
+                                echo '<script>setTimeout(() => window.location.href = "?page=login", 2000);</script>';
+                            } else {
+                                echo '<div class="notification error">Có lỗi xảy ra khi đăng ký!</div>';
                             }
-                            echo "</div>";
                         }
                     }
                 }
-            }
+                
+                echo '<div class="form-container">
+                        <h2 class="section-title">Đăng Ký</h2>
+                        <form method="POST">
+                            <div class="form-group">
+                                <input name="username" type="text" class="form-input" placeholder="Tên đăng nhập" required>
+                            </div>
+                            <div class="form-group">
+                                <input name="email" type="email" class="form-input" placeholder="Email" required>
+                            </div>
+                            <div class="form-group">
+                                <input name="password" type="password" class="form-input" placeholder="Mật khẩu" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary">Đăng Ký</button>
+                        </form>
+                      </div>';
+                break;
+
+            case 'logout':
+                session_destroy();
+                echo '<script>window.location.href = "?page=home";</script>';
+                exit;
+
+            case 'comic':
+                $comic_id = (int)($_GET['id'] ?? 0);
+                if ($comic_id <= 0) {
+                    echo '<div class="notification error">Truyện không tồn tại!</div>';
+                    break;
+                }
+                
+                $comic = $mysqli->query("SELECT * FROM comics WHERE id = $comic_id")->fetch_assoc();
+                if (!$comic) {
+                    echo '<div class="notification error">Không tìm thấy truyện!</div>';
+                    break;
+                }
+                
+                // Update view count
+                $mysqli->query("UPDATE comics SET views = views + 1 WHERE id = $comic_id");
+                
+                echo '<h1 class="page-title">' . sanitize($comic['title']) . '</h1>';
+                echo '<div style="display: flex; gap: 2rem; margin-bottom: 2rem;">
+                        <img src="' . sanitize($comic['thumbnail'] ?: 'https://via.placeholder.com/300x400') . '" 
+                             style="width: 300px; height: 400px; object-fit: cover; border-radius: 15px;">
+                        <div>
+                            <p><strong>Tác giả:</strong> ' . sanitize($comic['author'] ?: 'Chưa rõ') . '</p>
+                            <p><strong>Trạng thái:</strong> ' . sanitize($comic['status']) . '</p>
+                            <p><strong>Lượt xem:</strong> ' . number_format($comic['views']) . '</p>
+                            <p><strong>Theo dõi:</strong> ' . number_format($comic['follows']) . '</p>
+                            <p><strong>Mô tả:</strong></p>
+                            <p>' . nl2br(sanitize($comic['description'] ?: 'Chưa có mô tả')) . '</p>
+                        </div>
+                      </div>';
+                
+                echo '<h2 class="section-title">Danh Sách Chương</h2>';
+                $chapters = $mysqli->query("SELECT * FROM chapters WHERE comic_id = $comic_id ORDER BY id ASC");
+                if ($chapters && $chapters->num_rows > 0) {
+                    echo '<div class="chapter-list">';
+                    while ($chapter = $chapters->fetch_assoc()) {
+                        echo '<div class="chapter-item">
+                                <a href="?page=chapter&id=' . $chapter['id'] . '" class="chapter-link">
+                                    ' . sanitize($chapter['chapter_title']) . '
+                                </a>
+                                <span>' . getTimeAgo($chapter['created_at']) . '</span>
+                              </div>';
+                    }
+                    echo '</div>';
+                } else {
+                    echo '<div class="notification warning">Chưa có chương nào.</div>';
+                }
+                break;
+
+            case 'chapter':
+                if (!$user) {
+                    echo '<div class="notification warning">Bạn cần <a href="?page=login">đăng nhập</a> để đọc truyện.</div>';
+                    break;
+                }
+                
+                $chapter_id = (int)($_GET['id'] ?? 0);
+                if ($chapter_id <= 0) {
+                    echo '<div class="notification error">Chương không tồn tại!</div>';
+                    break;
+                }
+                
+                $chapter = $mysqli->query("
+                    SELECT c.*, co.title as comic_title, co.id as comic_id 
+                    FROM chapters c 
+                    JOIN comics co ON co.id = c.comic_id 
+                    WHERE c.id = $chapter_id
+                ")->fetch_assoc();
+                
+                if (!$chapter) {
+                    echo '<div class="notification error">Không tìm thấy chương!</div>';
+                    break;
+                }
+                
+                // Update view count and reading history
+                $mysqli->query("UPDATE chapters SET views = views + 1 WHERE id = $chapter_id");
+                $mysqli->query("INSERT INTO read_history (user_id, chapter_id) VALUES ({$user['id']}, $chapter_id) 
+                               ON DUPLICATE KEY UPDATE updated_at = NOW()");
+                
+                echo '<h1 class="page-title">' . sanitize($chapter['comic_title']) . ' - ' . sanitize($chapter['chapter_title']) . '</h1>';
+                
+                $images = $chapter['images'] ? explode("\n", trim($chapter['images'])) : [];
+                if (!empty($images)) {
+                    echo '<div style="text-align: center;">';
+                    foreach ($images as $image) {
+                        $image = trim($image);
+                        if (!empty($image)) {
+                            echo '<img src="' . sanitize($image) . '" style="max-width: 100%; margin-bottom: 1rem; border-radius: 10px;">';
+                        }
+                    }
+                    echo '</div>';
+                } else {
+                    echo '<div class="notification warning">Chương này chưa có nội dung.</div>';
+                }
+                
+                echo '<div style="text-align: center; margin-top: 2rem;">
+                        <a href="?page=comic&id=' . $chapter['comic_id'] . '" class="btn btn-primary">Quay lại danh sách chương</a>
+                      </div>';
+                break;
+
+            case 'admin':
+                if (!$user || !in_array($user['role'], ['admin', 'translator'])) {
+                    echo '<div class="notification error">Bạn không có quyền truy cập trang này!</div>';
+                    break;
+                }
+                
+                $action = $_GET['action'] ?? 'comic';
+                
+                echo '<h1 class="page-title">Quản Trị Hệ Thống</h1>';
+                echo '<div class="admin-nav">
+                        <button class="tab-btn ' . ($action == 'comic' ? 'active' : '') . '" onclick="location.href=\'?page=admin&action=comic\'">Quản lý truyện</button>
+                        <button class="tab-btn ' . ($action == 'chapter' ? 'active' : '') . '" onclick="location.href=\'?page=admin&action=chapter\'">Quản lý chương</button>
+                      </div>';
+                
+                if ($action == 'comic') {
+                    if ($_POST && isset($_POST['add_comic'])) {
+                        $title = sanitize($_POST['title']);
+                        $author = sanitize($_POST['author']);
+                        $description = sanitize($_POST['description']);
+                        $thumbnail = sanitize($_POST['thumbnail']);
+                        
+                        if (!empty($title)) {
+                            $stmt = $mysqli->prepare("INSERT INTO comics (title, author, description, thumbnail, created_by) VALUES (?, ?, ?, ?, ?)");
+                            $stmt->bind_param("ssssi", $title, $author, $description, $thumbnail, $user['id']);
+                            
+                            if ($stmt->execute()) {
+                                echo '<div class="notification success">Đã thêm truyện thành công!</div>';
+                            } else {
+                                echo '<div class="notification error">Có lỗi khi thêm truyện!</div>';
+                            }
+                        }
+                    }
+                    
+                    echo '<div class="admin-section">
+                            <h2 class="section-title">Thêm Truyện Mới</h2>
+                            <form method="POST">
+                                <div class="form-group">
+                                    <input name="title" type="text" class="form-input" placeholder="Tên truyện" required>
+                                </div>
+                                <div class="form-group">
+                                    <input name="author" type="text" class="form-input" placeholder="Tác giả">
+                                </div>
+                                <div class="form-group">
+                                    <input name="thumbnail" type="url" class="form-input" placeholder="Link ảnh bìa">
+                                </div>
+                                <div class="form-group">
+                                    <textarea name="description" class="form-input" placeholder="Mô tả truyện" rows="4"></textarea>
+                                </div>
+                                <button type="submit" name="add_comic" class="btn btn-primary">Thêm Truyện</button>
+                            </form>
+                          </div>';
+                    
+                    echo '<div class="admin-section">
+                            <h2 class="section-title">Danh Sách Truyện</h2>';
+                    
+                    $comics = $mysqli->query("SELECT * FROM comics ORDER BY id DESC");
+                    if ($comics && $comics->num_rows > 0) {
+                        while ($comic = $comics->fetch_assoc()) {
+                            echo '<div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; padding: 1rem; background: rgba(255,255,255,0.1); border-radius: 10px;">
+                                    <img src="' . sanitize($comic['thumbnail'] ?: 'https://via.placeholder.com/60x80') . '" style="width: 60px; height: 80px; object-fit: cover; border-radius: 5px;">
+                                    <div style="flex: 1;">
+                                        <h4>' . sanitize($comic['title']) . '</h4>
+                                        <p style="color: rgba(255,255,255,0.7);">' . sanitize($comic['author'] ?: 'Chưa rõ tác giả') . '</p>
+                                    </div>
+                                    <div>
+                                        <a href="?page=admin&action=chapter&comic_id=' . $comic['id'] . '" class="btn btn-outline" style="margin-right: 0.5rem;">Quản lý chương</a>
+                                        <a href="?page=comic&id=' . $comic['id'] . '" class="btn btn-primary">Xem</a>
+                                    </div>
+                                  </div>';
+                        }
+                    } else {
+                        echo '<div class="notification warning">Chưa có truyện nào.</div>';
+                    }
+                    echo '</div>';
+                    
+                } elseif ($action == 'chapter') {
+                    $comic_id = (int)($_GET['comic_id'] ?? 0);
+                    
+                    if ($_POST && isset($_POST['add_chapter'])) {
+                        $chapter_comic_id = (int)$_POST['comic_id'];
+                        $chapter_title = sanitize($_POST['chapter_title']);
+                        $images = sanitize($_POST['images']);
+                        
+                        if ($chapter_comic_id > 0 && !empty($chapter_title)) {
+                            $stmt = $mysqli->prepare("INSERT INTO chapters (comic_id, chapter_title, images) VALUES (?, ?, ?)");
+                            $stmt->bind_param("iss", $chapter_comic_id, $chapter_title, $images);
+                            
+                            if ($stmt->execute()) {
+                                echo '<div class="notification success">Đã thêm chương thành công!</div>';
+                            } else {
+                                echo '<div class="notification error">Có lỗi khi thêm chương!</div>';
+                            }
+                        }
+                    }
+                    
+                    echo '<div class="admin-section">
+                            <h2 class="section-title">Thêm Chương Mới</h2>
+                            <form method="POST">
+                                <div class="form-group">
+                                    <select name="comic_id" class="form-input" required>';
+                    
+                    $comics = $mysqli->query("SELECT id, title FROM comics ORDER BY title");
+                    echo '<option value="">Chọn truyện</option>';
+                    while ($comic = $comics->fetch_assoc()) {
+                        $selected = ($comic_id == $comic['id']) ? 'selected' : '';
+                        echo '<option value="' . $comic['id'] . '" ' . $selected . '>' . sanitize($comic['title']) . '</option>';
+                    }
+                    
+                    echo '</select>
+                                </div>
+                                <div class="form-group">
+                                    <input name="chapter_title" type="text" class="form-input" placeholder="Tên chương" required>
+                                </div>
+                                <div class="form-group">
+                                    <textarea name="images" class="form-input" placeholder="Link ảnh (mỗi dòng một link)" rows="6"></textarea>
+                                </div>
+                                <button type="submit" name="add_chapter" class="btn btn-primary">Thêm Chương</button>
+                            </form>
+                          </div>';
+                    
+                    if ($comic_id > 0) {
+                        $comic = $mysqli->query("SELECT title FROM comics WHERE id = $comic_id")->fetch_assoc();
+                        echo '<div class="admin-section">
+                                <h2 class="section-title">Chương của: ' . sanitize($comic['title']) . '</h2>';
+                        
+                        $chapters = $mysqli->query("SELECT * FROM chapters WHERE comic_id = $comic_id ORDER BY id DESC");
+                        if ($chapters && $chapters->num_rows > 0) {
+                            while ($chapter = $chapters->fetch_assoc()) {
+                                echo '<div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; padding: 1rem; background: rgba(255,255,255,0.1); border-radius: 10px;">
+                                        <div style="flex: 1;">
+                                            <h4>' . sanitize($chapter['chapter_title']) . '</h4>
+                                            <p style="color: rgba(255,255,255,0.7);">' . getTimeAgo($chapter['created_at']) . '</p>
+                                        </div>
+                                        <div>
+                                            <a href="?page=chapter&id=' . $chapter['id'] . '" class="btn btn-primary">Xem</a>
+                                        </div>
+                                      </div>';
+                            }
+                        } else {
+                            echo '<div class="notification warning">Chưa có chương nào.</div>';
+                        }
+                        echo '</div>';
+                    }
+                }
+                break;
+
+            case 'profile':
+                if (!$user) {
+                    echo '<div class="notification warning">Bạn cần <a href="?page=login">đăng nhập</a> để xem thông tin cá nhân.</div>';
+                    break;
+                }
+                
+                echo '<h1 class="page-title">Thông Tin Cá Nhân</h1>';
+                echo '<div class="admin-section">
+                        <div style="text-align: center;">
+                            <h2>' . sanitize($user['username']) . '</h2>
+                            <p><strong>Email:</strong> ' . sanitize($user['email'] ?: 'Chưa cập nhật') . '</p>
+                            <p><strong>Vai trò:</strong> ' . sanitize($user['role']) . '</p>
+                            <p><strong>Số xu:</strong> ' . number_format($user['coins']) . ' xu</p>
+                            <p><strong>Cảnh giới:</strong> ' . sanitize($user['realm']) . ' - ' . $user['realm_stage'] . '/10</p>
+                            <p><strong>Ngày tham gia:</strong> ' . date('d/m/Y', strtotime($user['created_at'])) . '</p>
+                        </div>
+                      </div>';
+                break;
+
+            default:
+                echo '<div class="notification error">Trang không tồn tại!</div>';
+                break;
         }
-    }
-}
-echo '</div></main>
-<script>
-function toggleMenu() {
-    let menu = document.getElementById("menu");
-    menu.style.display = menu.style.display==="block" ? "none" : "block";
-}
-document.addEventListener("click", function(e) {
-    const menu = document.getElementById("menu");
-    const avatar = document.querySelector(".avatar");
-    if (menu && !menu.contains(e.target) && e.target!==avatar) {
-        menu.style.display = "none";
-    }
-});
-function showReplyForm(id) {
-    let f = document.getElementById("reply-form-"+id);
-    if(f) f.style.display = (f.style.display==="block"?"none":"block");
-}
-</script>
+        ?>
+    </main>
+
+    <script>
+        // Simple JavaScript for interactivity
+        document.addEventListener('DOMContentLoaded', function() {
+            // Smooth scrolling
+            document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+                anchor.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const target = document.querySelector(this.getAttribute('href'));
+                    if (target) {
+                        target.scrollIntoView({ behavior: 'smooth' });
+                    }
+                });
+            });
+            
+            // Auto-hide notifications
+            setTimeout(() => {
+                const notifications = document.querySelectorAll('.notification');
+                notifications.forEach(notification => {
+                    notification.style.opacity = '0.7';
+                });
+            }, 3000);
+        });
+    </script>
 </body>
-</html>';
-?>
+</html>
